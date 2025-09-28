@@ -1,7 +1,7 @@
 # Forge4D: Feed-Forward 4D Human Reconstruction and Interpolation from Uncalibrated Sparse Videos
 
 [<img src="https://img.shields.io/badge/arXiv-2509.08862-b31b1b" alt="arXiv"></a>](https://github.com/zhenliuZJU/Forge4D)
-[![project page](https://img.shields.io/badge/project page-orange)](https://zhenliuzju.github.io/huyingdong/Forge4D)
+[<img src="https://img.shields.io/badge/project page-orange" alt="project page"></a>](https://zhenliuzju.github.io/huyingdong/Forge4D)
 
 Codebase for Forge4D: Feed-Forward 4D Human Reconstruction and Interpolation from Uncalibrated Sparse Videos
 
