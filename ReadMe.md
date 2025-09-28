@@ -12,7 +12,7 @@ Codebase for Forge4D: Feed-Forward 4D Human Reconstruction and Interpolation fro
 <img src="./assets/teaser.png" alt="results" width="800">
 </div>
 
-## Videos
+<!--## Videos -->
 
 ## Checklist
 - [ ] Release inference code and pretrained checkpoint
