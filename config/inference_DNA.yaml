@@ -1,0 +1,11 @@
+name: 'inference'
+
+dataname: ['DNA']
+pointmap: False
+
+dataset:
+  train_view_num: 4
+  resolution: 518
+  use_hr_img: False
+  data_root: '/path/to/your/data'
+  bg_color: [0.,0.,0.]

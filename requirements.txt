@@ -1,0 +1,14 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+gsplat>=1.0.0
+huggingface-hub>=0.20.0
+xformers>=0.0.22
+opencv-python>=4.8.0
+Pillow>=10.0.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+einops>=0.6.0
+lpips>=0.1.4
+tqdm>=4.65.0
+open3d>=0.17.0

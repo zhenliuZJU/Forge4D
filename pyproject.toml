@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "forge4d"
+version = "0.1.0"
+description = "Feed-Forward 4D Human Reconstruction and Interpolation from Uncalibrated Sparse Videos"
+readme = "ReadMe.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Yingdong Hu"},
+    {name = "Yisheng He"},
+]
+
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "gsplat>=1.0.0",
+    "huggingface-hub>=0.20.0",
+    "xformers>=0.0.22",
+    "opencv-python>=4.8.0",
+    "Pillow>=10.0.0",
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+    "einops>=0.6.0",
+    "lpips>=0.1.4",
+    "tqdm>=4.65.0",
+]
+
+[project.urls]
+"arXiv" = "https://arxiv.org/abs/2509.24209"
+"Project" = "https://zhenliuzju.github.io/huyingdong/Forge4D"
+
+[tool.setuptools.packages.find]
+include = ["forge4d*", "lib*", "config*", "gaussian_renderer*", "tools*"]

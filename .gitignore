@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Checkpoints & data
+*.pth
+*.ckpt
+checkpoints/
+output/
+vis_*/
+
+# Dataset
+data/
+
+# Misc
+.ossutil_checkpoint/
+metric_checkpoint/
