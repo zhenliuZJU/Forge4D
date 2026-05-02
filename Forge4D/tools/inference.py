@@ -11,10 +11,10 @@ import os
 from pathlib import Path
 import argparse
 
-from forge4d.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
+from codes.Forge4D.Forge4D.forge4d.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
 import cv2
-from forge4d.models.forge4d import VGGT
+from codes.Forge4D.Forge4D.forge4d.models.forge4d import VGGT
 from lib.dna_dataset import DNADataset
 from lib.utils import print_gpu_memory, quaternion_multiply
 

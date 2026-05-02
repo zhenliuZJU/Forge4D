@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from forge4d.layers import Mlp
-from forge4d.layers.block import Block
-from forge4d.heads.head_act import activate_pose
+from codes.Forge4D.Forge4D.forge4d.layers import Mlp
+from codes.Forge4D.Forge4D.forge4d.layers.block import Block
+from codes.Forge4D.Forge4D.forge4d.heads.head_act import activate_pose
 
 
-class CameraHead(nn.Module):
+class ScaleHead(nn.Module):
     """
     CameraHead predicts camera parameters from token representations using iterative refinement.
 
@@ -27,7 +27,6 @@ class CameraHead(nn.Module):
         self,
         dim_in: int = 2048,
         trunk_depth: int = 4,
-        pose_encoding_type: str = "absT_quaR_FoV",
         num_heads: int = 16,
         mlp_ratio: int = 4,
         init_values: float = 0.01,
@@ -37,10 +36,7 @@ class CameraHead(nn.Module):
     ):
         super().__init__()
 
-        if pose_encoding_type == "absT_quaR_FoV":
-            self.target_dim = 9
-        else:
-            raise ValueError(f"Unsupported camera encoding type: {pose_encoding_type}")
+        self.target_dim = 1
 
         self.trans_act = trans_act
         self.quat_act = quat_act
@@ -51,7 +47,7 @@ class CameraHead(nn.Module):
         self.trunk = nn.Sequential(
             *[
                 Block(
-                    dim=dim_in,
+                    dim=dim_in//4,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     init_values=init_values,
@@ -60,27 +56,25 @@ class CameraHead(nn.Module):
             ]
         )
 
-        # Normalizations for camera token and trunk output.
         self.token_norm = nn.LayerNorm(dim_in)
         self.trunk_norm = nn.LayerNorm(dim_in)
 
-        # Learnable empty camera pose token.
-        self.empty_pose_tokens = nn.Parameter(torch.zeros(1, 1, self.target_dim))
-        self.embed_pose = nn.Linear(self.target_dim, dim_in)
+        self.empty_scale_tokens = nn.Parameter(torch.zeros(1, self.target_dim))
+        self.embed_scale = nn.Linear(self.target_dim, dim_in)
 
         # Module for producing modulation parameters: shift, scale, and a gate.
-        self.poseLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim_in, 3 * dim_in, bias=True))
+        self.scaleLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim_in, 3 * dim_in, bias=True))
 
         # Adaptive layer normalization without affine parameters.
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
-        self.pose_branch = Mlp(
+        self.scale_branch = Mlp(
             in_features=dim_in,
             hidden_features=dim_in // 2,
             out_features=self.target_dim,
             drop=0,
         )
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+    def forward(self, aggregated_tokens_list: list, patch_start_idx: int, num_iterations: int = 4) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -96,62 +90,46 @@ class CameraHead(nn.Module):
         tokens = aggregated_tokens_list[-1]
 
         # Extract the camera tokens
-        pose_tokens = tokens[:, :, 0]
-        pose_tokens = self.token_norm(pose_tokens)
+        scale_tokens = tokens[:, :, 0].reshape(tokens.shape[0], -1)
+        scale_tokens = self.token_norm(scale_tokens)
 
-        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
-        return pred_pose_enc_list
+        pred_scale_enc_list = self.trunk_fn(scale_tokens, num_iterations)
+        return pred_scale_enc_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list:
-        """
-        Iteratively refine camera pose predictions.
-
-        Args:
-            pose_tokens (torch.Tensor): Normalized camera tokens with shape [B, 1, C].
-            num_iterations (int): Number of refinement iterations.
-
-        Returns:
-            list: List of activated camera encodings from each iteration.
-        """
-        B, S, C = pose_tokens.shape  # S is expected to be 1.
-        pred_pose_enc = None
-        pred_pose_enc_list = []
+    def trunk_fn(self, scale_tokens: torch.Tensor, num_iterations: int) -> list:
+        B, D = scale_tokens.shape  # S is expected to be 1.
+        pred_scale_enc = None
+        pred_scale_enc_list = []
 
         for _ in range(num_iterations):
-            # Use a learned empty pose for the first iteration.
-            if pred_pose_enc is None:
-                module_input = self.embed_pose(self.empty_pose_tokens.expand(B, S, -1))
+            if pred_scale_enc is None:
+                module_input = self.embed_scale(self.empty_scale_tokens.expand(B, -1))
             else:
                 # Detach the previous prediction to avoid backprop through time.
-                pred_pose_enc = pred_pose_enc.detach()
-                module_input = self.embed_pose(pred_pose_enc)
+                pred_scale_enc = pred_scale_enc.detach()
+                module_input = self.embed_scale(pred_scale_enc)
 
             # Generate modulation parameters and split them into shift, scale, and gate components.
-            shift_msa, scale_msa, gate_msa = self.poseLN_modulation(module_input).chunk(3, dim=-1)
+            shift_msa, scale_msa, gate_msa = self.scaleLN_modulation(module_input).chunk(3, dim=-1)
 
             # Adaptive layer normalization and modulation.
-            pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
-            pose_tokens_modulated = pose_tokens_modulated + pose_tokens
+            scale_tokens_modulated = gate_msa * modulate(self.adaln_norm(scale_tokens), shift_msa, scale_msa)
+            scale_tokens_modulated = scale_tokens_modulated + scale_tokens
 
-            pose_tokens_modulated = self.trunk(pose_tokens_modulated)
-            # Compute the delta update for the pose encoding.
-            pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
+            scale_tokens_modulated = self.trunk(scale_tokens_modulated.reshape(B,4,D//4)).reshape(B,D)
+            # Compute the delta update for the scale encoding.
+            pred_scale_enc_delta = self.scale_branch(self.trunk_norm(scale_tokens_modulated))
 
-            if pred_pose_enc is None:
-                pred_pose_enc = pred_pose_enc_delta
+            if pred_scale_enc is None:
+                pred_scale_enc = pred_scale_enc_delta
             else:
-                pred_pose_enc = pred_pose_enc + pred_pose_enc_delta
+                pred_scale_enc = pred_scale_enc + pred_scale_enc_delta
 
             # Apply final activation functions for translation, quaternion, and field-of-view.
-            activated_pose = activate_pose(
-                pred_pose_enc,
-                trans_act=self.trans_act,
-                quat_act=self.quat_act,
-                fl_act=self.fl_act,
-            )
-            pred_pose_enc_list.append(activated_pose)
+            activated_scale = F.relu(pred_scale_enc)
+            pred_scale_enc_list.append(activated_scale)
 
-        return pred_pose_enc_list
+        return pred_scale_enc_list
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

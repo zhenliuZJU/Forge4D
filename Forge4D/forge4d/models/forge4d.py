@@ -18,12 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 
-from forge4d.models.aggregator import RecurrentAggregator_CA
-from forge4d.heads.camera_head import CameraHead
-from forge4d.heads.dpt_head import DPTHead, DPTGSHead, DPTMotionHead
-from forge4d.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
-from forge4d.utils.rotation import quat_to_mat, mat_to_quat
-from forge4d.layers.fusion import GaussianFusion
+from codes.Forge4D.Forge4D.forge4d.models.aggregator import RecurrentAggregator_CA
+from codes.Forge4D.Forge4D.forge4d.heads.camera_head import CameraHead
+from codes.Forge4D.Forge4D.forge4d.heads.dpt_head import DPTHead, DPTGSHead, DPTMotionHead
+from codes.Forge4D.Forge4D.forge4d.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
+from codes.Forge4D.Forge4D.forge4d.utils.rotation import quat_to_mat, mat_to_quat
+from codes.Forge4D.Forge4D.forge4d.layers.fusion import GaussianFusion
 from lib.loss import l1_loss, l2_loss, ssim, psnr, PerceptualLoss
 
 from lib.GaussianRender import pts2render
@@ -31,7 +31,7 @@ from lib.utils import print_gpu_memory, quaternion_multiply
 from lib.flow import image_warp
 
 
-class VGGT(nn.Module, PyTorchModelHubMixin):
+class Forge4D(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024, motion_dimension=3, point_map=False, scaling_factor=1.0, num_scene_tokens=1024):
         super().__init__()
         depth = 24
@@ -47,6 +47,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.fusion = GaussianFusion(in_channels=23, out_channels=11)
 
         self.scene_token = nn.Parameter(torch.zeros(depth, num_scene_tokens, embed_dim))
+
+    # Dynamic Version with stage 3 with be released around 5.7
+
 
     def forward(
         self,
