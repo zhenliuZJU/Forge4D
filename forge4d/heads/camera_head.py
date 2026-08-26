@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from codes.Forge4D.Forge4D.forge4d.layers import Mlp
-from codes.Forge4D.Forge4D.forge4d.layers.block import Block
-from codes.Forge4D.Forge4D.forge4d.heads.head_act import activate_pose
+from forge4d.layers import Mlp
+from forge4d.layers.block import Block
+from forge4d.heads.head_act import activate_pose
 
 
 class CameraHead(nn.Module):

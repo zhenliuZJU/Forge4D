@@ -304,7 +304,7 @@ class DPTHead(nn.Module):
         return out
 
 
-class DPTGSHead(nn.Module):
+class GaussianHead(nn.Module):
     """
     DPT  Head for dense prediction tasks.
 
@@ -340,7 +340,7 @@ class DPTGSHead(nn.Module):
         feature_only: bool = False,
         down_ratio: int = 1,
     ) -> None:
-        super(DPTGSHead, self).__init__()
+        super(GaussianHead, self).__init__()
         self.patch_size = patch_size
         self.activation = activation
         self.conf_activation = conf_activation
@@ -631,7 +631,7 @@ class DPTGSHead(nn.Module):
         return out
 
 
-class DPTMotionHead(nn.Module):
+class MotionHead(nn.Module):
     """
     DPT  Head for dense prediction tasks.
 
@@ -668,7 +668,7 @@ class DPTMotionHead(nn.Module):
         down_ratio: int = 1,
         res_dim: int = 12,
     ) -> None:
-        super(DPTMotionHead, self).__init__()
+        super(MotionHead, self).__init__()
         self.patch_size = patch_size
         self.activation = activation
         self.conf_activation = conf_activation

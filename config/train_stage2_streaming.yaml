@@ -1,0 +1,32 @@
+# Stage 2: streaming reconstruction with learnable state tokens (no motion).
+name: 'forge4d_stage2_streaming'
+
+dataname: ['DNA', 'DNAP3', 'DNAP4', 'DNAP5', 'DNAP6']
+probs: [0.2, 0.2, 0.2, 0.2, 0.2]
+val_dataname: ['Genebody', 'DNA']
+
+pointmap: False
+# Checkpoint from stage 1.
+stage1_ckpt: '/path/to/stage1_ckpt.pth'
+lr: 0.00005
+wdecay: 1e-5
+batch_size: 1
+num_steps: 100000
+sampling_rate: 2
+# Informational only — train_dynamic.py does not branch on cfg.stage.
+stage: 'streaming'
+
+loss:
+  flow: 0.
+  lpips: 0.2
+
+dataset:
+  train_view_num: 4
+  resolution: 518
+  use_hr_img: False
+  data_root: '/path/to/datasets'
+  bg_color: [0., 0., 0.]
+
+record:
+  loss_freq: 200
+  eval_freq: 5000

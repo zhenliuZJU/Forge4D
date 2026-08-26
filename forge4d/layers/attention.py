@@ -316,4 +316,471 @@ class MemEffAttention(Attention):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+def print_memory_table(headers, data):
+    """打印内存占用表格"""
+    print("\n" + "="*80)
+    print("显存占用对比表")
+    print("="*80)
+    
+    # 使用简单格式打印表格
+    col_widths = [max(len(str(row[i])) for row in data + [headers]) for i in range(len(headers))]
+    
+    # 打印表头
+    header_row = " | ".join(f"{headers[i]:^{col_widths[i]}}" for i in range(len(headers)))
+    print(header_row)
+    print("-" * len(header_row))
+    
+    # 打印数据行
+    for row in data:
+        row_str = " | ".join(f"{str(row[i]):^{col_widths[i]}}" for i in range(len(row)))
+        print(row_str)
+
+def format_memory(mb_value):
+    """格式化内存显示"""
+    if mb_value >= 1024:
+        return f"{mb_value/1024:.1f} GB"
+    else:
+        return f"{mb_value:.0f} MB"
+
+def measure_attention_memory(attention_class, batch_size, seq_len, dim, num_heads, 
+                           forward_only=True, mixed_precision=False):
+    """测量Attention模块的内存占用"""
+    try:
+        # 清理内存
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # 记录初始内存
+        initial_memory = torch.cuda.memory_allocated() / 1024**2
+        
+        # 创建模块
+        attention = attention_class(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=True,
+            proj_bias=True,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            fused_attn=True
+        ).cuda()
+        
+        # 切换到评估模式
+        attention.eval()
+        
+        # 创建测试数据
+        dtype = torch.bfloat16 if mixed_precision else torch.float32
+        x = torch.randn(batch_size, seq_len, dim, device='cuda', dtype=dtype)
+        pos = torch.arange(seq_len, device='cuda').unsqueeze(0).expand(batch_size, -1)
+        
+        # 前向传播
+        with torch.no_grad():
+            torch.cuda.reset_peak_memory_stats()
+            
+            if attention_class.__name__ == 'FlashCrossAttention':
+                x2 = torch.randn(batch_size, seq_len, dim, device='cuda', dtype=dtype)
+                pos2 = torch.arange(seq_len, device='cuda').unsqueeze(0).expand(batch_size, -1)
+                output = attention(x, x2, pos, pos2)
+            else:
+                output = attention(x, pos)
+            
+            peak_memory_forward = torch.cuda.max_memory_allocated() / 1024**2
+        
+        # 后向传播（如果需要）
+        peak_memory_backward = 0
+        if not forward_only:
+            attention.train()
+            
+            if attention_class.__name__ == 'FlashCrossAttention':
+                output = attention(x, x2, pos, pos2)
+            else:
+                output = attention(x, pos)
+            
+            loss = output.sum()
+            
+            torch.cuda.reset_peak_memory_stats()
+            loss.backward()
+            peak_memory_backward = torch.cuda.max_memory_allocated() / 1024**2
+        
+        # 最终内存
+        final_memory = torch.cuda.memory_allocated() / 1024**2
+        memory_increase = final_memory - initial_memory
+        
+        # 清理
+        del attention, x, pos, output
+        if 'x2' in locals():
+            del x2, pos2
+        
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        return {
+            'peak_forward': peak_memory_forward,
+            'peak_backward': peak_memory_backward,
+            'memory_increase': memory_increase,
+            'status': '成功'
+        }
+        
+    except torch.cuda.OutOfMemoryError:
+        return {
+            'peak_forward': float('inf'),
+            'peak_backward': float('inf'),
+            'memory_increase': float('inf'),
+            'status': 'OOM'
+        }
+    except Exception as e:
+        return {
+            'peak_forward': 0,
+            'peak_backward': 0,
+            'memory_increase': 0,
+            'status': f'错误: {str(e)[:30]}'
+        }
+
+def print_model_comparison():
+    """打印不同模型的显存占用对比"""
+    
+    # 定义要测试的模型
+    attention_classes = [
+        ('FlashAttention', FlashAttention),
+        ('LinearAttention', LinearAttention),
+        ('Attention', Attention),
+        ('MemEffAttention', MemEffAttention),
+    ]
+    
+    # 定义测试配置
+    test_configs = [
+        ('配置1', 1, 5604, 1024, 8, False),
+        ('配置2', 1, 6500, 1024, 8, False),
+        ('配置3', 1, 7524, 1024, 8, False),
+        ('配置3', 1, 10952, 1024, 8, False),
+    ]
+    
+    print("\n" + "="*100)
+    print("不同Attention模型显存占用对比测试")
+    print("="*100)
+    
+    # 测试前向传播
+    print("\n📊 前向传播显存占用对比:")
+    print("-"*100)
+    
+    table_data = []
+    headers = ["配置名称", "Batch", "SeqLen", "Dim", "Heads", "精度"] + \
+              [model_name for model_name, _ in attention_classes]
+    
+    for config_name, bs, sl, dim, heads, mix_prec in test_configs:
+        row = [
+            config_name,
+            bs,
+            sl,
+            dim,
+            heads,
+            "BF16" if mix_prec else "FP32"
+        ]
+        
+        for model_name, model_class in attention_classes:
+            result = measure_attention_memory(
+                model_class, bs, sl, dim, heads, 
+                forward_only=True,
+                mixed_precision=mix_prec
+            )
+            
+            if result['status'] == '成功':
+                memory_str = format_memory(result['peak_forward'])
+                row.append(memory_str)
+            else:
+                row.append(result['status'])
+        
+        table_data.append(row)
+    
+    # 打印表格
+    print(print_memory_table(headers, table_data))
+    
+    # 测试前向+反向传播
+    print("\n\n📊 前向+反向传播显存占用对比:")
+    print("-"*100)
+    
+    # 使用较小配置以避免OOM
+    train_configs = [
+        ('训练-小配置', 2, 128, 512, 8, False),
+        ('训练-中配置', 2, 256, 512, 8, False),
+    ]
+    
+    table_data_train = []
+    headers_train = ["配置名称", "Batch", "SeqLen", "Dim", "Heads", "精度"] + \
+                   [model_name for model_name, _ in attention_classes]
+    
+    for config_name, bs, sl, dim, heads, mix_prec in train_configs:
+        row = [
+            config_name,
+            bs,
+            sl,
+            dim,
+            heads,
+            "BF16" if mix_prec else "FP32"
+        ]
+        
+        for model_name, model_class in attention_classes:
+            result = measure_attention_memory(
+                model_class, bs, sl, dim, heads, 
+                forward_only=False,
+                mixed_precision=mix_prec
+            )
+            
+            if result['status'] == '成功':
+                memory_str = format_memory(result['peak_backward'])
+                row.append(memory_str)
+            else:
+                row.append(result['status'])
+        
+        table_data_train.append(row)
+    
+    print(print_memory_table(headers, table_data))
+
+def print_config_scaling():
+    """打印不同配置下的显存缩放情况"""
+    
+    print("\n" + "="*100)
+    print("配置缩放显存占用分析")
+    print("="*100)
+    
+    # 测试单个模型在不同配置下的表现
+    model_name = "FlashAttention"
+    model_class = FlashAttention
+    
+    # Batch Size 缩放
+    print("\n📈 Batch Size 缩放 (SeqLen=256, Dim=512, Heads=8):")
+    print("-"*80)
+    
+    batch_sizes = [1, 2, 4, 8, 16]
+    table_data = []
+    headers = ["Batch Size", "前向峰值内存", "内存增长倍数", "状态"]
+    
+    prev_memory = None
+    for bs in batch_sizes:
+        result = measure_attention_memory(model_class, bs, 256, 512, 8, True, False)
+        
+        if result['status'] == '成功':
+            memory = result['peak_forward']
+            growth = memory / prev_memory if prev_memory and prev_memory > 0 else 1.0
+            table_data.append([
+                bs,
+                format_memory(memory),
+                f"{growth:.2f}x",
+                "成功"
+            ])
+            prev_memory = memory
+        else:
+            table_data.append([bs, "-", "-", result['status']])
+            break
+    
+    print(print_memory_table(headers, table_data))
+    
+    # Sequence Length 缩放
+    print("\n\n📈 Sequence Length 缩放 (Batch=2, Dim=512, Heads=8):")
+    print("-"*80)
+    
+    seq_lengths = [64, 128, 256, 512, 1024]
+    table_data = []
+    headers = ["Seq Length", "前向峰值内存", "内存增长倍数", "状态"]
+    
+    prev_memory = None
+    for sl in seq_lengths:
+        result = measure_attention_memory(model_class, 2, sl, 512, 8, True, False)
+        
+        if result['status'] == '成功':
+            memory = result['peak_forward']
+            growth = memory / prev_memory if prev_memory and prev_memory > 0 else 1.0
+            table_data.append([
+                sl,
+                format_memory(memory),
+                f"{growth:.2f}x",
+                "成功"
+            ])
+            prev_memory = memory
+        else:
+            table_data.append([sl, "-", "-", result['status']])
+            break
+    
+    print(print_memory_table(headers, table_data))
+    
+    # Model Dimension 缩放
+    print("\n\n📈 Model Dimension 缩放 (Batch=2, SeqLen=256, Heads=8):")
+    print("-"*80)
+    
+    dimensions = [256, 512, 768, 1024, 1536]
+    table_data = []
+    headers = ["Model Dim", "前向峰值内存", "内存增长倍数", "状态"]
+    
+    prev_memory = None
+    for dim in dimensions:
+        heads = 8 if dim >= 512 else 4  # 调整head数
+        result = measure_attention_memory(model_class, 2, 256, dim, heads, True, False)
+        
+        if result['status'] == '成功':
+            memory = result['peak_forward']
+            growth = memory / prev_memory if prev_memory and prev_memory > 0 else 1.0
+            table_data.append([
+                dim,
+                format_memory(memory),
+                f"{growth:.2f}x",
+                "成功"
+            ])
+            prev_memory = memory
+        else:
+            table_data.append([dim, "-", "-", result['status']])
+            break
+    
+    print(print_memory_table(headers, table_data))
+
+def print_mixed_precision_benefit():
+    """打印混合精度的收益"""
+    
+    print("\n" + "="*100)
+    print("混合精度内存节省分析")
+    print("="*100)
+    
+    configs = [
+        ('配置1', 1, 5604, 1024, 8),
+        ('配置2', 1, 6500, 1024, 8),
+        ('配置3', 1, 7524, 1024, 8),
+    ]
+    
+    table_data = []
+    headers = ["配置", "Batch", "SeqLen", "Dim", "Heads", "FP32内存", "BF16内存", "节省比例", "状态"]
+    
+    for config_name, bs, sl, dim, heads in configs:
+        # FP32测试
+        result_fp32 = measure_attention_memory(FlashAttention, bs, sl, dim, heads, True, False)
+        # BF16测试
+        result_bf16 = measure_attention_memory(FlashAttention, bs, sl, dim, heads, True, True)
+        
+        if result_fp32['status'] == '成功' and result_bf16['status'] == '成功':
+            mem_fp32 = result_fp32['peak_forward']
+            mem_bf16 = result_bf16['peak_forward']
+            savings = (mem_fp32 - mem_bf16) / mem_fp32 * 100
+            
+            table_data.append([
+                config_name,
+                bs,
+                sl,
+                dim,
+                heads,
+                format_memory(mem_fp32),
+                format_memory(mem_bf16),
+                f"{savings:.1f}%",
+                "成功"
+            ])
+        else:
+            status = "FP32失败" if result_fp32['status'] != '成功' else "BF16失败"
+            table_data.append([
+                config_name,
+                bs,
+                sl,
+                dim,
+                heads,
+                "-",
+                "-",
+                "-",
+                status
+            ])
+    
+    print(print_memory_table(headers, table_data))
+
+def print_summary_statistics():
+    """打印总结统计信息"""
+    
+    print("\n" + "="*100)
+    print("显存占用总结统计")
+    print("="*100)
+    
+    # 典型配置测试
+    typical_config = (2, 256, 512, 8)  # (batch, seq_len, dim, heads)
+    models = [
+        ('FlashAttention', FlashAttention),
+        # ('LinearAttention', LinearAttention),
+        # ('Attention', Attention),
+        # ('MemEffAttention', MemEffAttention),
+    ]
+    
+    print("\n🔍 典型配置 (Batch=2, SeqLen=256, Dim=512, Heads=8) 内存占用:")
+    print("-"*80)
+    
+    summary_data = []
+    for model_name, model_class in models:
+        result = measure_attention_memory(model_class, *typical_config, True, False)
+        
+        if result['status'] == '成功':
+            summary_data.append([
+                model_name,
+                format_memory(result['peak_forward']),
+                format_memory(result['memory_increase']),
+                "✅"
+            ])
+        else:
+            summary_data.append([
+                model_name,
+                "-",
+                "-",
+                "❌ " + result['status']
+            ])
+    
+    headers = ["模型", "峰值内存", "内存增量", "状态"]
+    print(print_memory_table(headers, summary_data))
+    
+    # 内存效率排名
+    print("\n🏆 内存效率排名 (从低到高):")
+    print("-"*80)
+    
+    efficiency_data = []
+    for model_name, model_class in models:
+        result = measure_attention_memory(model_class, *typical_config, True, False)
+        if result['status'] == '成功':
+            efficiency_data.append((model_name, result['peak_forward']))
+    
+    # 按内存占用排序
+    efficiency_data.sort(key=lambda x: x[1])
+    
+    rank_data = []
+    for i, (model_name, memory) in enumerate(efficiency_data):
+        rank_data.append([i+1, model_name, format_memory(memory)])
+    
+    print(print_memory_table(["排名", "模型", "内存占用"], rank_data))
+
+def main():
+    """主函数"""
+    if not torch.cuda.is_available():
+        print("错误: 需要GPU环境运行显存测试")
+        return
+    
+    print(f"🏃 开始显存占用测试...")
+    print(f"🖥️  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"💾  总显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    print(f"🔧  CUDA版本: {torch.version.cuda}")
+    print(f"⚡  PyTorch版本: {torch.__version__}")
+    
+    try:
+        # 1. 不同模型对比
+        print_model_comparison()
+        
+        # 2. 配置缩放分析
+        print_config_scaling()
+        
+        # 3. 混合精度收益
+        print_mixed_precision_benefit()
+        
+        # 4. 总结统计
+        print_summary_statistics()
+        
+        print("\n" + "✅"*50)
+        print("所有测试完成!")
+        print("✅"*50)
+        
+    except Exception as e:
+        print(f"\n❌ 测试过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 运行主测试
+    main()
         

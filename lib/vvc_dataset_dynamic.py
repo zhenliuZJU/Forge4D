@@ -1,0 +1,1321 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+from torchvision import transforms as TF
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+
+import random
+import numpy as np
+import os
+from PIL import Image
+import cv2
+import torch
+from lib.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
+from pathlib import Path
+import logging
+import json
+from tqdm import tqdm
+import yaml
+
+def save_np_to_json(parm, save_name):
+    for key in parm.keys():
+        parm[key] = parm[key].tolist()
+    with open(save_name, 'w') as file:
+        json.dump(parm, file, indent=1)
+
+
+def load_json_to_np(parm_name):
+    with open(parm_name, 'r') as f:
+        parm = json.load(f)
+    for key in parm.keys():
+        parm[key] = np.array(parm[key])
+    return parm
+
+
+def depth2pts(depth, extrinsic, intrinsic):
+    # depth H W extrinsic 3x4 intrinsic 3x3 pts map H W 3
+    pts_map = []
+    for view in range(depth.shape[0]):
+        rot = extrinsic[view, :3, :3]
+        trans = extrinsic[view, :3, 3:]
+        S, S = depth[view, 0].shape
+
+        y, x = torch.meshgrid(torch.linspace(0.5, S-0.5, S, device=depth.device),
+                            torch.linspace(0.5, S-0.5, S, device=depth.device))
+        pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1)  # H W 3
+
+        pts_2d[..., 2] = depth[view, 0]
+        pts_2d[..., 0] -= intrinsic[view, 0, 2]
+        pts_2d[..., 1] -= intrinsic[view, 1, 2]
+        pts_2d_xy = pts_2d[..., :2] * pts_2d[..., 2:]
+        pts_2d = torch.cat([pts_2d_xy, pts_2d[..., 2:]], dim=-1)
+
+        pts_2d[..., 0] /= intrinsic[view, 0, 0]
+        pts_2d[..., 1] /= intrinsic[view, 1, 1]
+        pts_2d = pts_2d.reshape(-1, 3).T
+        pts = rot.T @ pts_2d - rot.T @ trans
+        # pts = pts_2d
+
+        pts_map.append(pts.view(3, S, S))
+    
+    return torch.stack(pts_map, dim=0)
+
+
+def pts2depth(ptsmap, extrinsic, intrinsic):
+    S, S, _ = ptsmap.shape
+    pts = ptsmap.view(-1, 3).T
+    calib = intrinsic @ extrinsic
+    pts = calib[:3, :3] @ pts
+    pts = pts + calib[:3, 3:4]
+    pts[:2, :] /= (pts[2:, :] + 1e-8)
+    depth = 1.0 / (pts[2, :].view(S, S) + 1e-8)
+    return depth
+
+
+def stereo_pts2flow(pts0, pts1, rectify0, rectify1, Tf_x):
+    new_extr0, new_intr0, rectify_mat0_x, rectify_mat0_y = rectify0
+    new_extr1, new_intr1, rectify_mat1_x, rectify_mat1_y = rectify1
+    new_depth0 = pts2depth(torch.FloatTensor(pts0), torch.FloatTensor(new_extr0), torch.FloatTensor(new_intr0))
+    new_depth1 = pts2depth(torch.FloatTensor(pts1), torch.FloatTensor(new_extr1), torch.FloatTensor(new_intr1))
+    new_depth0 = new_depth0.detach().numpy()
+    new_depth1 = new_depth1.detach().numpy()
+    new_depth0 = cv2.remap(new_depth0, rectify_mat0_x, rectify_mat0_y, cv2.INTER_LINEAR)
+    new_depth1 = cv2.remap(new_depth1, rectify_mat1_x, rectify_mat1_y, cv2.INTER_LINEAR)
+
+    offset0 = new_intr1[0, 2] - new_intr0[0, 2]
+    disparity0 = -new_depth0 * Tf_x
+    flow0 = offset0 - disparity0
+
+    offset1 = new_intr0[0, 2] - new_intr1[0, 2]
+    disparity1 = -new_depth1 * (-Tf_x)
+    flow1 = offset1 - disparity1
+
+    flow0[new_depth0 < 0.05] = 0
+    flow1[new_depth1 < 0.05] = 0
+
+    return flow0, flow1
+
+
+def read_img(name):
+    img = np.array(Image.open(name))
+    return img
+
+
+def read_depth(name):
+    return cv2.imread(name, cv2.IMREAD_UNCHANGED).astype(np.float32) / 2.0 ** 15
+
+
+class VVCDataset(Dataset):
+    def __init__(self, opt, phase='train', test_ids=None, sampling_rate=1, timesteps=12):
+        self.opt = opt
+        self.use_processed_data = opt.use_processed_data
+        self.phase = phase
+        self.dataset_path = opt.data_root
+
+        ## 001_1_seq0
+        self.train_novel_id = [19,33,17]
+        self.val_novel_id = [19,33,17]
+        self.input_cams = [12,15,28,52]
+        self.source_id = [12,15,28,52]
+        # self.train_novel_id = [15,47,8]
+        # self.val_novel_id = [15,47,8]
+        # self.input_cams = [12,28,51,29]
+        # self.source_id = [12,28,51,29]
+
+        self.timesteps = timesteps
+        sampling_rate = sampling_rate
+        self.sampling_rate = sampling_rate
+
+        id_path = os.path.join(self.dataset_path, 'VVC')
+        # human_ids = os.listdir(id_path)
+        # human_ids = ['001_1_seq0']
+        human_ids = ['012_0_seq0']
+        if test_ids is None:
+            test_ids = human_ids
+            # test_ids = ['001_1_seq0']
+            # test_ids = ['012_0_seq0']
+
+        self.sample_list = []
+        if self.phase == 'train':
+            for human_id in human_ids:
+                # # temporal compromise for the dataset
+                # if not any(ids in human_id for ids in train_ids):
+                #     continue
+                    
+                if any(ids in human_id for ids in test_ids):
+                    continue
+                img_path = os.path.join(self.dataset_path, 'VVC', human_id, 'images', '12')
+                files = [f for f in os.listdir(img_path) if f.endswith(".jpg")]
+                max_timestep = max([int(f.split(".")[0]) for f in files], default=-1)
+                # # temporal compromise for the dataset
+                max_timestep=min(6000,max_timestep)
+
+                ## corgi
+                # max_timestep=min(1000,max_timestep)
+                if max_timestep != -1:
+                    self.sample_list += [(human_id, 3*cam_shift, t) for cam_shift in [0] for t in range(0, max_timestep-2-sampling_rate*(timesteps-1), sampling_rate)]
+                    # self.sample_list += [(human_id, 3*cam_shift, t) for cam_shift in [0] for t in range(50, max_timestep-2-sampling_rate*(timesteps-1), sampling_rate)]
+            # self.sample_list = [("0008_01", 3*cam_shift, t) for cam_shift in [0] for t in [76]]
+        else:
+            for human_id in human_ids:
+                if not any(ids in human_id for ids in test_ids):
+                    continue
+                img_path = os.path.join(self.dataset_path, 'VVC', human_id, 'images', '12')
+                files = [f for f in os.listdir(img_path) if f.endswith(".jpg")]
+                max_timestep = max([int(f.split(".")[0]) for f in files], default=-1)
+                ## dance
+                max_timestep=min(6000,max_timestep)
+                if max_timestep != -1:
+                    self.sample_list += [(human_id, 3*cam_shift, t) for cam_shift in [0] for t in range(0, max_timestep-2-sampling_rate*(timesteps-1), sampling_rate)] #range(-1,2)
+
+                ## corgi
+                # max_timestep=min(1000,max_timestep)
+                # if max_timestep != -1:
+                #     self.sample_list += [(human_id, 3*cam_shift, t) for cam_shift in [0] for t in range(250, max_timestep-2-sampling_rate*(timesteps-1), sampling_rate)] #range(-1,2)
+
+    def load_novel_view(self, sample_name, view_ids):
+        human_id, cam_shift, frame_id = sample_name
+        intrs, extrs, imgs, masks = [], [], [], []
+        novel_time, novel_time_mask = [], []
+        for step in range(self.timesteps):
+            timestep = frame_id + step * self.sampling_rate
+
+            img_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'images/{(source_id + cam_shift):02d}', f'{timestep:06d}.jpg') for source_id in view_ids]
+            mask_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'masks/{(source_id + cam_shift):02d}', f'{timestep:06d}.png') for source_id in view_ids]
+            cam_names = os.path.join(self.dataset_path, 'VVC', human_id)
+
+            img, intr, mask = load_and_preprocess_images_masks_intrs(img_names, mask_names, cam_names, [(source_id + cam_shift) for source_id in view_ids], res=self.opt.resolution)
+            # img, intr = load_and_preprocess_images_intrs(img_names, cam_names, [(source_id + cam_shift) for source_id in view_ids], self.opt.resolution)
+            # mask = load_and_preprocess_masks(mask_names, self.opt.resolution).squeeze(dim=0)
+
+            extr, _ = load_extrs(cam_names, [source_id for source_id in view_ids], normalize=False) 
+
+            intrs.append(intr)
+            extrs.append(extr)
+            imgs.append(img)
+            masks.append(mask)
+
+            if step != self.timesteps-1:
+                timestep = frame_id + step * self.sampling_rate + self.sampling_rate//2
+
+                img_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'images/{(source_id + cam_shift):02d}', f'{timestep:06d}.jpg')for source_id in view_ids]
+                mask_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'masks/{(source_id + cam_shift):02d}', f'{timestep:06d}.png') for source_id in view_ids]
+
+                img, intr, mask = load_and_preprocess_images_masks_intrs(img_names, mask_names, cam_names, [(source_id + cam_shift) for source_id in view_ids], res=self.opt.resolution)
+                # img, intr = load_and_preprocess_images_intrs(img_names, cam_names, [(source_id + cam_shift) for source_id in view_ids], self.opt.resolution)
+                # mask = load_and_preprocess_masks(mask_names, self.opt.resolution).squeeze(dim=0)
+
+                novel_time.append(img)
+                novel_time_mask.append(mask)
+
+        return torch.stack(imgs, dim=0), torch.stack(masks, dim=0), torch.stack(intrs, dim=0), torch.stack(extrs, dim=0), torch.stack(novel_time, dim=0), torch.stack(novel_time_mask, dim=0)
+
+    def get_novel_view_tensor(self, sample_name, view_id):
+        img, mask, intr, w2c, novel_time, novel_time_mask = self.load_novel_view(sample_name, view_id)
+        width, height = img.shape[2], img.shape[3]
+        w2c = torch.einsum('tvij, tjk->tvik', [w2c, self.c_one_2_w])
+        w2c[:, :, :3, 3] = w2c[:, :, :3, 3] / self.scale
+
+        novel_view_data = {
+            'view_id': torch.IntTensor([view_id]),
+            'img': img,
+            'mask': mask,
+            'extr': torch.FloatTensor(w2c),
+            'intr': torch.FloatTensor(intr),
+            'novel_time': novel_time,
+            'novel_time_mask': novel_time_mask
+        }
+
+        return novel_view_data
+
+    def get_origin_data(self, sample_name, require_mask=True):
+        human_id, cam_shift, frame_id = sample_name
+        intrs, extrs, imgs, flow_fws, flow_bws, masks, c_one_2_w_s = [], [], [], [], [], [], []
+        novel_time, novel_time_mask = [], []
+        for step in range(self.timesteps):
+            timestep = frame_id + step * self.sampling_rate
+
+            img_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'images/{(self.input_cams[i]+cam_shift):02d}', f'{timestep:06d}.jpg') for i in range(self.train_view_num)] 
+            mask_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'masks/{(self.input_cams[i]+cam_shift):02d}', f'{timestep:06d}.png')  for i in range(self.train_view_num)]
+            cam_names = os.path.join(self.dataset_path, 'VVC', human_id)
+
+            img, intr, mask = load_and_preprocess_images_masks_intrs(img_names, mask_names, cam_names, [(input_cams+cam_shift) for input_cams in self.input_cams], res=self.opt.resolution)
+            # img, intr = load_and_preprocess_images_intrs(img_names, cam_names, [(input_cams+cam_shift) for input_cams in self.input_cams], self.opt.resolution)
+            # mask = load_and_preprocess_masks(mask_names, self.opt.resolution)
+
+            # depth = load_and_preprocess_depth(depth_names)
+            extr, c_one_2_w = load_extrs(cam_names, [(input_cams+cam_shift) for input_cams in self.input_cams]) 
+
+            intrs.append(intr)
+            extrs.append(extr)
+            imgs.append(img)
+            masks.append(mask)
+            c_one_2_w_s.append(c_one_2_w)
+            
+            if step != self.timesteps-1:
+                timestep = frame_id + step * self.sampling_rate + self.sampling_rate//2
+
+                img_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'images/{(self.input_cams[i]+cam_shift):02d}', f'{timestep:06d}.jpg') for i in range(self.train_view_num)] 
+                mask_names = [os.path.join(self.dataset_path, 'VVC', human_id, f'masks/{(self.input_cams[i]+cam_shift):02d}', f'{timestep:06d}.png')  for i in range(self.train_view_num)]
+
+                img, intr, mask = load_and_preprocess_images_masks_intrs(img_names, mask_names, cam_names, [(input_cams+cam_shift) for input_cams in self.input_cams], res=self.opt.resolution)
+                # img, intr = load_and_preprocess_images_intrs(img_names, cam_names, [(input_cams+cam_shift) for input_cams in self.input_cams], self.opt.resolution)
+                # mask = load_and_preprocess_masks(mask_names, self.opt.resolution)
+
+                novel_time.append(img)
+                novel_time_mask.append(mask)
+
+        self.scale = 1
+        self.c_one_2_w = torch.stack(c_one_2_w_s, dim=0)
+
+        # scaling the data
+        # extrs[:, :3, 3] = extrs[:, :3, 3] / self.scale
+        # depth = depth / self.scale
+        # pointmap = pointmap / self.scale
+
+        depth, pointmap = torch.tensor(0), torch.tensor(0)
+
+        camera = {
+            'intr': torch.stack(intrs, dim=0),
+            'extr': torch.stack(extrs, dim=0)
+        }
+
+        data = {
+            'scene': human_id,
+            'imgs': torch.stack(imgs, dim=0), # T, V, C, H, W
+            'masks': torch.stack(masks, dim=0),
+            'depth': depth,
+            'pointmap': pointmap,
+            'camera': camera,
+            'novel_time': torch.stack(novel_time, dim=0),
+            'novel_time_mask': torch.stack(novel_time_mask, dim=0)
+        }
+
+        return data
+        
+
+    def get_item(self, index, novel_id=None):
+        sample_id = index % len(self.sample_list)
+        sample_name = self.sample_list[sample_id]
+        # rand_shift = 3*random.randint(0, 16)
+        # rand_shift = 3*random.randint(-1, 1)
+        # rand_shift = 0
+        if len(self.source_id) <= self.opt.train_view_num:
+            self.input_cams = self.source_id
+            self.train_view_num = len(self.input_cams)
+            # for i in range(len(self.input_cams)):
+            #     self.input_cams[i] = (self.input_cams[i]+rand_shift)%48 
+        else:
+            self.input_cams = random.sample(self.source_id, self.opt.train_view_num)
+            self.train_view_num = self.opt.self.opt.train_view_num
+            # for i in range(len(self.input_cams)):
+            #     self.input_cams[i] = (self.input_cams[i]+rand_shift)%48
+        dict_tensor = self.get_origin_data(sample_name, require_mask=True)
+
+        if not novel_id:
+            novel_id = self.val_cams
+        
+        # novel_id = np.random.choice(novel_id) #(np.random.choice(novel_id)+rand_shift)%48
+        dict_tensor.update({
+            'novel_view': self.get_novel_view_tensor(sample_name, novel_id)
+        })
+        # print("rand_shift:", rand_shift)
+        # print(self.input_cams)
+        # print('novel_id:', novel_id)
+
+        return dict_tensor
+
+    def get_test_item(self, index, source_id):
+        sample_id = index % len(self.sample_list)
+        sample_name = self.sample_list[sample_id]
+
+        if self.use_processed_data:
+            logging.error('test data loader not support processed data')
+
+        view0_data = self.load_single_view(sample_name, source_id[0], hr_img=False, require_mask=True, require_pts=False)
+        view1_data = self.load_single_view(sample_name, source_id[1], hr_img=False, require_mask=True, require_pts=False)
+        lmain_intr_ori, lmain_extr_ori = view0_data[2], view0_data[3]
+        rmain_intr_ori, rmain_extr_ori = view1_data[2], view1_data[3]
+        stereo_np = self.get_rectified_stereo_data(main_view_data=view0_data, ref_view_data=view1_data)
+        dict_tensor = self.stereo_to_dict_tensor(stereo_np, sample_name)
+
+        dict_tensor['lmain']['intr_ori'] = torch.FloatTensor(lmain_intr_ori)
+        dict_tensor['rmain']['intr_ori'] = torch.FloatTensor(rmain_intr_ori)
+        dict_tensor['lmain']['extr_ori'] = torch.FloatTensor(lmain_extr_ori)
+        dict_tensor['rmain']['extr_ori'] = torch.FloatTensor(rmain_extr_ori)
+
+        img_len = 2048 if self.opt.use_hr_img else 1024
+        novel_dict = {
+            'height': torch.IntTensor([img_len]),
+            'width': torch.IntTensor([img_len])
+        }
+
+        dict_tensor.update({
+            'novel_view': novel_dict
+        })
+
+        return dict_tensor
+
+    def __getitem__(self, index):
+        if self.phase == 'train':
+            return self.get_item(index, novel_id=self.train_novel_id)
+        elif self.phase == 'val':
+            return self.get_item(index, novel_id=self.val_novel_id)
+
+    def __len__(self):
+        self.train_boost = 50
+        self.val_boost = 200
+        return len(self.sample_list)
+
+
+def read_opencv_yaml(yaml_file):
+    """通用的 OpenCV YAML 文件读取函数"""
+    fs = cv2.FileStorage(yaml_file, cv2.FILE_STORAGE_READ)
+    
+    if not fs.isOpened():
+        raise ValueError(f"无法打开文件: {yaml_file}")
+    
+    # 读取相机名称
+    names_node = fs.getNode("names")
+    names = []
+    if names_node.isSeq():
+        for i in range(names_node.size()):
+            names.append(names_node.at(i).string())
+    
+    data = {'names': names}
+    
+    # 读取所有数据
+    for name in names:
+        camera_data = {}
+        
+        # 读取矩阵类型的数据
+        matrix_keys = ['R', 'Rot', 'T', 'bounds', 'K', 'D', 'ccm']
+        for key in matrix_keys:
+            node = fs.getNode(f"{key}_{name}")
+            if not node.empty():
+                camera_data[key] = node.mat()
+        
+        # 读取标量类型的数据
+        scalar_keys = ['t', 'n', 'f', 'H', 'W']
+        for key in scalar_keys:
+            node = fs.getNode(f"{key}_{name}")
+            if not node.empty():
+                camera_data[key] = node.real()
+        
+        data[name] = camera_data
+    
+    fs.release()
+    return data
+
+def load_and_preprocess_images(image_path_list, res=518, mode="crop", crop_rate=0.1):
+    """
+    A quick start function to load and preprocess images for model input.
+    This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
+
+    Args:
+        image_path_list (list): List of paths to image files
+        mode (str, optional): Preprocessing mode, either "crop" or "pad".
+                             - "crop" (default): Sets width to 518px and center crops height if needed.
+                             - "pad": Preserves all pixels by making the largest dimension 518px
+                               and padding the smaller dimension to reach a square shape.
+
+    Returns:
+        torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
+
+    Raises:
+        ValueError: If the input list is empty or if mode is invalid
+
+    Notes:
+        - Images with different dimensions will be padded with white (value=1.0)
+        - A warning is printed when images have different shapes
+        - When mode="crop": The function ensures width=518px while maintaining aspect ratio
+          and height is center-cropped if larger than 518px
+        - When mode="pad": The function ensures the largest dimension is 518px while maintaining aspect ratio
+          and the smaller dimension is padded to reach a square shape (518x518)
+        - Dimensions are adjusted to be divisible by 14 for compatibility with model requirements
+    """
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Validate mode
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    images = []
+    shapes = set()
+    to_tensor = TF.ToTensor()
+    target_size = res# 518
+
+    # First process all images and collect their shapes
+    for image_path in image_path_list:
+
+        # Open image
+        img = Image.open(image_path)
+
+        # If there's an alpha channel, blend onto white background:
+        if img.mode == "RGBA":
+            # Create white background
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            # Alpha composite onto the white background
+            img = Image.alpha_composite(background, img)
+
+        # Now convert to "RGB" (this step assigns white for transparent areas)
+        img = img.convert("RGB")
+
+        width, height = img.size
+        bbox = (int(crop_rate*width), int(crop_rate*height), width-int(crop_rate*width), height-int(crop_rate*height))
+        img = img.crop(bbox)
+
+        width, height = img.size
+        
+        if mode == "pad":
+            # Make the largest dimension 518px while maintaining aspect ratio
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
+        else:  # mode == "crop"
+            # Original behavior: set width to 518px
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        # Resize with new dimensions (width, height)
+        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        img = to_tensor(img)  # Convert to tensor (0, 1)
+
+        # Center crop height if it's larger than 518 (only in crop mode)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[:, start_y : start_y + target_size, :]
+        
+        # For pad mode, pad to make a square of target_size x target_size
+        if mode == "pad":
+            h_padding = target_size - img.shape[1]
+            w_padding = target_size - img.shape[2]
+            
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                
+                # Pad with white (value=1.0)
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img)
+
+    # Check if we have different shapes
+    # In theory our model can also work well with different shapes
+    if len(shapes) > 1:
+        print(f"Warning: Found images with different shapes: {shapes}")
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for img in images:
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+            padded_images.append(img)
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    # Ensure correct shape when single image
+    if len(image_path_list) == 1:
+        # Verify shape is (1, C, H, W)
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+    return images
+
+def load_and_preprocess_masks(image_path_list, res=518, mode="crop", crop_rate=0.1):
+        # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Validate mode
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    images = []
+    shapes = set()
+    to_tensor = TF.ToTensor()
+    target_size = res #518
+
+    # First process all images and collect their shapes
+    for image_path in image_path_list:
+
+        # Open image
+        img = Image.open(image_path)
+
+        # Now convert to "L" (this step assigns white for transparent areas)
+        img = img.convert("L")
+
+        width, height = img.size
+        bbox = (int(crop_rate*width), int(crop_rate*height), width-int(crop_rate*width), height-int(crop_rate*height))
+        img = img.crop(bbox)
+
+        width, height = img.size
+        
+        if mode == "pad":
+            # Make the largest dimension 518px while maintaining aspect ratio
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
+        else:  # mode == "crop"
+            # Original behavior: set width to 518px
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        # Resize with new dimensions (width, height)
+        img = img.resize((new_width, new_height), Image.NEAREST)
+        img = to_tensor(img)  # Convert to tensor (0, 1)
+
+        # Center crop height if it's larger than 518 (only in crop mode)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[:, start_y : start_y + target_size, :]
+        
+        # For pad mode, pad to make a square of target_size x target_size
+        if mode == "pad":
+            h_padding = target_size - img.shape[0]
+            w_padding = target_size - img.shape[1]
+            
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                
+                # Pad with white (value=1.0)
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img)
+
+    # Check if we have different shapes
+    # In theory our model can also work well with different shapes
+    if len(shapes) > 1:
+        print(f"Warning: Found images with different shapes: {shapes}")
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for img in images:
+            h_padding = max_height - img.shape[0]
+            w_padding = max_width - img.shape[1]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+            padded_images.append(img)
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    # Ensure correct shape when single image
+    if len(image_path_list) == 1:
+        # Verify shape is (1, H, W)
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+    return images
+
+def load_and_preprocess_flow(flow_path_list, res=518, mode="crop", crop_rate=0.1):
+    """Load and preprocess optical flow data (with both positive and negative float values)
+    
+    Args:
+        flow_path_list: List of paths to .npy files containing flow data [H,W,2]
+        res: Target resolution (default 518)
+        mode: Either "crop" or "pad" for resizing strategy
+        crop_rate: Percentage to crop from each side before processing
+        
+    Returns:
+        Processed flow tensor [N,2,H,W] where N is number of flows
+    """
+    if len(flow_path_list) == 0:
+        raise ValueError("At least 1 flow file is required")
+    
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    flows = []
+    shapes = set()
+    target_size = res
+
+    for flow_path in flow_path_list:
+        # Load flow data [H,W,2]
+        flow = np.load(flow_path)
+        
+        # Convert to tensor and permute to [2,H,W]
+        flow = torch.from_numpy(flow).float().squeeze()
+        
+        # Apply cropping
+        _, height, width = flow.shape
+        crop_h = int(crop_rate * height)
+        crop_w = int(crop_rate * width)
+        flow = flow[:, crop_h:height-crop_h, crop_w:width-crop_w]
+        
+        _, height, width = flow.shape
+        
+        # Calculate new dimensions
+        if mode == "pad":
+            if width >= height:
+                new_width = target_size
+                ratio = new_width / width
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                ratio = new_height / height
+                new_width = round(width * (new_height / height) / 14) * 14
+        else:  # crop mode
+            new_width = target_size
+            ratio = new_width / width
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        # Resize flow using bilinear interpolation
+        # flow = F.interpolate(flow.unsqueeze(0), size=(new_height, new_width), 
+        #                     mode='nearest').squeeze(0)
+        flow = F.interpolate(flow.unsqueeze(0), size=(new_height, new_width), 
+                            mode='bilinear', align_corners=True).squeeze(0)
+        flow = flow * ratio
+        
+        # Center crop if needed (crop mode)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            flow = flow[:, start_y:start_y+target_size, :]
+        
+        # Pad if needed (pad mode)
+        if mode == "pad":
+            h_pad = target_size - flow.shape[1]
+            w_pad = target_size - flow.shape[2]
+            
+            if h_pad > 0 or w_pad > 0:
+                pad_top = h_pad // 2
+                pad_bottom = h_pad - pad_top
+                pad_left = w_pad // 2
+                pad_right = w_pad - pad_left
+                
+                # Pad with zeros (neutral value for flow)
+                flow = F.pad(flow, (pad_left, pad_right, pad_top, pad_bottom), 
+                            mode='constant', value=0)
+
+        shapes.add((flow.shape[1], flow.shape[2]))
+        flows.append(flow)
+
+    # Handle different shapes by padding to max dimensions
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        padded_flows = []
+        for flow in flows:
+            h_pad = max_height - flow.shape[1]
+            w_pad = max_width - flow.shape[2]
+
+            if h_pad > 0 or w_pad > 0:
+                pad_top = h_pad // 2
+                pad_bottom = h_pad - pad_top
+                pad_left = w_pad // 2
+                pad_right = w_pad - pad_left
+
+                flow = F.pad(flow, (pad_left, pad_right, pad_top, pad_bottom), 
+                            mode='constant', value=0)
+            padded_flows.append(flow)
+        flows = padded_flows
+
+    flows = torch.stack(flows)  # [N,2,H,W]
+
+    if len(flow_path_list) == 1 and flows.dim() == 3:
+        flows = flows.unsqueeze(0)
+
+    return flows
+
+def load_and_preprocess_depth(image_path_list, res=518, mode="crop", crop_rate=0.1):
+        # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Validate mode
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    images = []
+    shapes = set()
+    target_size = res # 518
+
+    # First process all images and collect their shapes
+    for image_path in image_path_list:
+
+        # Open image
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 10000
+
+        width, height = img.size
+        img = img[int(crop_rate*height):int(width-crop_rate*width), int(crop_rate*width):int(width-crop_rate*width)]
+
+        height, width = img.shape[:2]
+        
+        if mode == "pad":
+            # Make the largest dimension 518px while maintaining aspect ratio
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
+        else:  # mode == "crop"
+            # Original behavior: set width to 518px
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
+        img = torch.FloatTensor(img).unsqueeze(dim=-1)  # Convert to tensor (0, 1)
+
+        # Center crop height if it's larger than 518 (only in crop mode)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[start_y : start_y + target_size, :, :]
+        
+        # For pad mode, pad to make a square of target_size x target_size
+        if mode == "pad":
+            h_padding = target_size - img.shape[0]
+            w_padding = target_size - img.shape[1]
+            
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                
+                # Pad with white (value=1.0)
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img.permute(2,0,1))
+
+    # Check if we have different shapes
+    # In theory our model can also work well with different shapes
+    if len(shapes) > 1:
+        print(f"Warning: Found images with different shapes: {shapes}")
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for img in images:
+            h_padding = max_height - img.shape[0]
+            w_padding = max_width - img.shape[1]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+            padded_images.append(img)
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    # Ensure correct shape when single image
+    if len(image_path_list) == 1:
+        # Verify shape is (1, H, W)
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+    return images
+
+def load_and_preprocess_images_intrs(image_path_list, camera_files, cam_ids, res=518, mode="crop", crop_rate=0.1):
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Validate mode
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    images = []
+    intrs = []
+    shapes = set()
+    to_tensor = TF.ToTensor()
+    target_size = res#518
+    
+    camera_files = os.path.join(camera_files, 'intri.yml')
+    # with open(camera_files, 'r', encoding='utf-8') as f:
+    #     cam = yaml.safe_load(f)
+    cam = read_opencv_yaml(camera_files)
+
+    # First process all images and collect their shapes
+    for i, image_path in enumerate(image_path_list):
+        # 内参矩阵 K
+        intr = cam[f"{cam_ids[i]:04d}"]['K']
+        intr = np.array(intr).reshape(3, 3)
+
+        # Open image
+        img = Image.open(image_path)
+
+        # If there's an alpha channel, blend onto white background:
+        if img.mode == "RGBA":
+            # Create white background
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            # Alpha composite onto the white background
+            img = Image.alpha_composite(background, img)
+
+        # Now convert to "RGB" (this step assigns white for transparent areas)
+        img = img.convert("RGB")
+
+        width, height = img.size
+        bbox = (int(crop_rate*width), int(crop_rate*height), width-int(crop_rate*width), height-int(crop_rate*height))
+        img = img.crop(bbox)
+
+        intr[0, 2] -= int(crop_rate*width)
+        intr[1, 2] -= int(crop_rate*height)
+
+        width, height = img.size
+        
+        if mode == "pad":
+            # Make the largest dimension 518px while maintaining aspect ratio
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
+        else:  # mode == "crop"
+            # Original behavior: set width to 518px
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        # Resize with new dimensions (width, height)
+        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        img = to_tensor(img)  # Convert to tensor (0, 1)
+        scale_h = new_height / height
+        scale_w = new_width / width
+        intr[0, 0] *= scale_w
+        intr[0, 2] *= scale_w
+        intr[1, 1] *= scale_h
+        intr[1, 2] *= scale_h
+
+        # Center crop height if it's larger than 518 (only in crop mode)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[:, start_y : start_y + target_size, :]
+            intr[1, 2] -= start_y
+
+        
+        # For pad mode, pad to make a square of target_size x target_size
+        if mode == "pad":
+            raise ValueError("Pad mode is not implemented for intrs")
+            h_padding = target_size - img.shape[1]
+            w_padding = target_size - img.shape[2]
+            
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                
+                # Pad with white (value=1.0)
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        images.append(img)
+        intrs.append(torch.from_numpy(intr).float())
+
+    # Check if we have different shapes
+    # In theory our model can also work well with different shapes
+    if len(shapes) > 1:
+        print(f"Warning: Found images with different shapes: {shapes}")
+        # Find maximum dimensions
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        # Pad images if necessary
+        padded_images = []
+        for img in images:
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                img = torch.nn.functional.pad(
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                )
+            padded_images.append(img)
+        images = padded_images
+
+    images = torch.stack(images)  # concatenate images
+
+    # Ensure correct shape when single image
+    if len(image_path_list) == 1:
+        # Verify shape is (1, C, H, W)
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+    
+    intrs = torch.stack(intrs)
+    if len(cam_ids) == 1:
+        if intrs.dim() == 2:
+            intrs = intrs.unsqueeze(0)
+
+    return images, intrs
+
+def load_and_preprocess_images_masks_intrs(image_path_list, mask_path_list, camera_files, cam_ids, first_frame_path_list=None, first_frame_mask_path_list=None, mode="crop", res=518, crop_rate=0.1):
+    """
+    A quick start function to load and preprocess images for model input.
+    This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
+
+    Args:
+        image_path_list (list): List of paths to image files
+        mode (str, optional): Preprocessing mode, either "crop" or "pad".
+                             - "crop" (default): Sets width to 518px and center crops height if needed.
+                             - "pad": Preserves all pixels by making the largest dimension 518px
+                               and padding the smaller dimension to reach a square shape.
+
+    Returns:
+        torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
+
+    Raises:
+        ValueError: If the input list is empty or if mode is invalid
+
+    Notes:
+        - Images with different dimensions will be padded with white (value=1.0)
+        - A warning is printed when images have different shapes
+        - When mode="crop": The function ensures width=518px while maintaining aspect ratio
+          and height is center-cropped if larger than 518px
+        - When mode="pad": The function ensures the largest dimension is 518px while maintaining aspect ratio
+          and the smaller dimension is padded to reach a square shape (518x518)
+        - Dimensions are adjusted to be divisible by 14 for compatibility with model requirements
+    """
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Validate mode
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+
+    camera_files = os.path.join(camera_files, 'intri.yml')
+    # with open(camera_files, 'r', encoding='utf-8') as f:
+    #     cam = yaml.safe_load(f)
+    cam = read_opencv_yaml(camera_files)
+    if first_frame_path_list is None:
+        images = []
+        masks = []
+        intrs = []
+        shapes = set()
+        to_tensor = TF.ToTensor()
+        target_size = res#518
+        
+
+        # First process all images and collect their shapes
+        for i, (image_path, mask_path) in enumerate(zip(image_path_list, mask_path_list)):
+            intr = cam[f"{cam_ids[i]:02d}"]['K']
+            intr = np.array(intr).reshape(3, 3)
+
+            # Open image
+            img = Image.open(image_path)
+            mask = Image.open(mask_path)
+
+            img = img.convert("RGB")
+            mask = mask.convert("L")
+
+            width, height = img.size
+            img = to_tensor(img)  # Convert to tensor (0, 1)
+            mask = to_tensor(mask)  # Convert to tensor (0, 1)
+
+            # Center crop height if it's larger than 518 (only in crop mode)
+            if mode == "crop" :
+                def mask_center_crop(mask):
+                    ys, xs = np.where(mask > 0)
+
+                    if len(xs) == 0 or len(ys) == 0:
+                        raise Exception("empty mask")
+
+                    x_min = np.min(xs)
+                    x_max = np.max(xs)
+                    y_min = np.min(ys)
+                    y_max = np.max(ys)
+                    x_res = int(0.1*(x_max-x_min))
+                    y_res = int(0.1*(y_max-y_min))
+                    # x_res = int(0.2*(x_max-x_min))
+                    # y_res = int(0.2*(y_max-y_min))
+                    x_min = max(x_min-x_res, 0)
+                    x_max = min(x_max+x_res, width)
+                    y_min = max(y_min-y_res, 0)
+                    y_max = min(y_max+y_res, height)
+                    
+                    min_height_width = min(height, width)
+                    # crop_size = min_height_width
+                    crop_size = min(max(x_max-x_min, y_max-y_min), min_height_width)
+                    
+                    center_x, center_y = x_min+(x_max-x_min)//2, y_min+(y_max-y_min)//2
+                    offset_x = min(max(center_x-crop_size//2, 0), width-crop_size)
+                    offset_y = min(max(center_y-crop_size//2, 0), height-crop_size)
+                    
+                    return offset_x, offset_y, crop_size
+                start_x, start_y, crop_size = mask_center_crop(mask.squeeze().numpy())
+                # start_y = (new_height - target_size) // 2
+                # img = img[:, start_y : start_y + target_size, :]
+                new_img = img[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                new_mask = mask[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                intr[1, 2] -= start_y
+                intr[0, 2] -= start_x
+            
+            width, height = new_img.shape[-2:]
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = target_size
+
+            # Resize with new dimensions (width, height)
+            img = F.interpolate(
+                new_img.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="bicubic",
+                align_corners=False
+            ).squeeze(0)
+            mask = F.interpolate(
+                new_mask.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="nearest",
+            ).squeeze(0)
+            scale_h = new_height / height
+            scale_w = new_width / width
+            intr[0, 0] *= scale_w
+            intr[0, 2] *= scale_w
+            intr[1, 1] *= scale_h
+            intr[1, 2] *= scale_h
+
+            shapes.add((img.shape[1], img.shape[2]))
+            images.append(img)
+            masks.append(mask)
+            intrs.append(torch.from_numpy(intr).float())
+
+        # Check if we have different shapes
+        # In theory our model can also work well with different shapes
+        if len(shapes) > 1:
+            raise NotImplementError
+        images = torch.stack(images)  # concatenate images
+        masks = torch.stack(masks)
+        intrs = torch.stack(intrs)
+
+        return images, intrs, masks
+    
+    else:
+        images = []
+        masks = []
+        intrs = []
+        first_frames = []
+        first_frame_masks = []
+        shapes = set()
+        to_tensor = TF.ToTensor()
+        target_size = res#518
+        
+
+        # First process all images and collect their shapes
+        for i, (image_path, mask_path, first_frame_path, first_frame_mask_path) in enumerate(zip(image_path_list, mask_path_list, first_frame_path_list, first_frame_mask_path_list)):
+            intr = cam[f"{cam_ids[i]:04d}"]['K']
+            intr = np.array(intr).reshape(3, 3)
+
+            # Open image
+            img = Image.open(image_path)
+            first_frame = Image.open(first_frame_path)
+            mask = Image.open(mask_path)
+            first_frame_mask = Image.open(first_frame_mask_path)
+
+            img = img.convert("RGB")
+            first_frame = first_frame.convert("RGB")
+            mask = mask.convert("L")
+            first_frame_mask = first_frame_mask.convert("L")
+
+            width, height = img.size
+            img = to_tensor(img)  # Convert to tensor (0, 1)
+            first_frame = to_tensor(first_frame)
+            mask = to_tensor(mask)  # Convert to tensor (0, 1)
+            first_frame_mask = to_tensor(first_frame_mask)  # Convert to tensor (0, 1)
+
+            # Center crop height if it's larger than 518 (only in crop mode)
+            if mode == "crop" :
+                def mask_center_crop(mask):
+                    ys, xs = np.where(mask > 0)
+
+                    if len(xs) == 0 or len(ys) == 0:
+                        raise Exception("empty mask")
+
+                    x_min = np.min(xs)
+                    x_max = np.max(xs)
+                    y_min = np.min(ys)
+                    y_max = np.max(ys)
+                    
+                    # center_x, center_y = width//2, height//2
+                    
+                    crop_size = min(max(x_max-x_min, y_max-y_min), width)
+                    offset_x = min(x_min, width-crop_size)
+                    offset_y = min(y_min, height-crop_size)
+                    
+                    return offset_x, offset_y, crop_size
+                start_x, start_y, crop_size = mask_center_crop(mask.squeeze().numpy())
+                # start_y = (new_height - target_size) // 2
+                # img = img[:, start_y : start_y + target_size, :]
+                new_img = img[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                new_first_frame = first_frame[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                new_mask = mask[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                new_first_frame_mask = first_frame_mask[:, start_y : start_y + crop_size, start_x : start_x + crop_size]
+                intr[1, 2] -= start_y
+                intr[0, 2] -= start_x
+            
+            width, height = new_img.shape[-2:]
+            new_width = target_size
+            # Calculate height maintaining aspect ratio, divisible by 14
+            new_height = target_size
+
+            # Resize with new dimensions (width, height)
+            img = F.interpolate(
+                new_img.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="bicubic",
+                align_corners=False
+            ).squeeze(0)
+            first_frame = F.interpolate(
+                new_first_frame.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="bicubic",
+                align_corners=False
+            ).squeeze(0)
+            first_frame_mask = F.interpolate(
+                new_first_frame_mask.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="nearest",
+            ).squeeze(0)
+            mask = F.interpolate(
+                new_mask.unsqueeze(0),
+                size=(new_height, new_width),
+                mode="nearest",
+            ).squeeze(0)
+            scale_h = new_height / height
+            scale_w = new_width / width
+            intr[0, 0] *= scale_w
+            intr[0, 2] *= scale_w
+            intr[1, 1] *= scale_h
+            intr[1, 2] *= scale_h
+
+            shapes.add((img.shape[1], img.shape[2]))
+            images.append(img)
+            first_frames.append(first_frame)
+            first_frame_masks.append(first_frame_mask)
+            masks.append(mask)
+            intrs.append(torch.from_numpy(intr).float())
+
+        # Check if we have different shapes
+        # In theory our model can also work well with different shapes
+        if len(shapes) > 1:
+            raise NotImplementError
+        images = torch.stack(images)  # concatenate images
+        masks = torch.stack(masks)
+        intrs = torch.stack(intrs)
+        first_frames = torch.stack(first_frames)
+        first_frame_masks = torch.stack(first_frame_masks)
+
+        return images, intrs, masks, first_frames, first_frame_masks
+
+def load_extrs(camera_files, cam_ids, normalize=True):
+    camera_files = os.path.join(camera_files, 'extri.yml')
+    # with open(camera_files, 'r', encoding='utf-8') as f:
+        # cam = yaml.safe_load(f)
+    cam = read_opencv_yaml(camera_files)
+
+    extrs = []
+    c_one_2_w = None
+    for cam_id in cam_ids:
+        w2c = torch.eye(4,4)
+        R = cam[f"{cam_id:02d}"]['Rot']
+        R = np.array(R).reshape(3, 3)
+        
+        # 平移向量 T (3x1)
+        T = cam[f"{cam_id:02d}"]['T']
+        T = np.array(T).reshape(3, 1)
+
+        w2c[:3,:3] = torch.FloatTensor(R)
+        w2c[:3,3:] = torch.FloatTensor(T)
+
+        if c_one_2_w==None:
+            c_one_2_w = torch.eye(4,4)
+            c_one_2_w[:3,:3] = w2c[:3,:3].T
+            c_one_2_w[:3, 3] = -w2c[:3,3]@w2c[:3,:3]
+
+        if normalize:
+            w2c = w2c@c_one_2_w
+    
+        extrs.append(w2c)
+
+    extrs = torch.stack(extrs)
+    extrs[:, :3, 3] = extrs[:, :3, 3]
+    if len(cam_ids) == 1:
+        if extrs.dim() == 2:
+            extrs = extrs.unsqueeze(0)
+
+    return extrs, c_one_2_w
+
+def load_intrs(intr_list):
+    intrs = []
+    for intr_path in intr_list:
+        intr = np.load(intr_path, allow_pickle=True)
+        intrs.append(torch.from_numpy(intr)).float()
+
+    intrs = torch.stack(intrs)
+    if len(intr_list) == 1:
+        if intrs.dim() == 2:
+            intrs = intrs.unsqueeze(0)
+
+    return intrs

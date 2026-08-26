@@ -115,11 +115,11 @@ def pose_encoding_to_extri_intri(
         extrinsics = torch.cat([R, T[..., None]], dim=-1)
         
         n, v, _, _ = extrinsics.shape
-        # Pad last row [0, 0, 0, 1]
+        # 补齐最后一行 [0, 0, 0, 1]
         last_row = torch.tensor([0, 0, 0, 1], dtype=extrinsics.dtype, device=extrinsics.device)
-        last_row = last_row.reshape(1, 1, 1, 4).expand(n, v, -1, -1)  # shape (n, v, 1, 4)
+        last_row = last_row.reshape(1, 1, 1, 4).expand(n, v, -1, -1)  # 形状 (n, v, 1, 4)
 
-        # Concatenate along dim=2
+        # 沿 dim=1 拼接
         extrinsics = torch.cat([extrinsics, last_row], dim=2)
 
         if build_intrinsics:

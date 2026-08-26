@@ -1,9 +1,13 @@
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 from lib.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
+import matplotlib.pyplot as plt
+import numpy as np
+import open3d as o3d
 
 
 def get_novel_calib(data, opt, ratio=0.5, intr_key='intr', extr_key='extr'):
@@ -62,7 +66,7 @@ def depth2pc(depth, extrinsic, intrinsic):
     trans = extrinsic[:, :3, 3:]
 
     y, x = torch.meshgrid(torch.linspace(0.5, S-0.5, S, device=depth.device), torch.linspace(0.5, S-0.5, S, device=depth.device))
-    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # B S S 3
 
     pts_2d[..., 2] = 1.0 / (depth + 1e-8)
     pts_2d[:, :, :, 0] -= intrinsic[:, None, None, 0, 2]
@@ -87,7 +91,7 @@ def absolutedepth2pc(depth, extrinsic, intrinsic):
     trans = extrinsic[:, :3, 3:]
 
     y, x = torch.meshgrid(torch.linspace(0.5, S-0.5, S, device=depth.device), torch.linspace(0.5, S-0.5, S, device=depth.device))
-    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # B S S 3
 
     pts_2d[..., 2] = depth
     pts_2d[:, :, :, 0] -= intrinsic[:, None, None, 0, 2]
@@ -104,6 +108,14 @@ def absolutedepth2pc(depth, extrinsic, intrinsic):
 
     return pts.permute(0, 2, 1)
 
+def add_gaussian_noise(data):
+    for view in ['lmain', 'rmain']:
+        b,c,h,w = data[view]['depth_pred'].shape
+        gaussian_noise = 0.002*torch.randn(b, c, h, w).to(data[view]['depth_pred'])
+
+        data[view]['depth_pred'] = data[view]['depth_pred']+gaussian_noise
+    
+    return data
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -123,6 +135,7 @@ C3 = [
     1.445305721320277,
     -0.5900435899266435
 ]
+
 C4 = [
     2.5033429417967046,
     -1.7701307697799304,
@@ -135,14 +148,16 @@ C4 = [
     0.6258357354491761,
 ]
 
-
 def eval_sh(deg, sh, dirs):
-    """Evaluate spherical harmonics at unit directions using hardcoded SH polynomials.
-
+    """
+    Evaluate spherical harmonics at unit directions
+    using hardcoded SH polynomials.
+    Works with torch/np/jnp.
+    ... Can be 0 or more batch dimensions.
     Args:
-        deg: int SH deg. Currently 0-3 supported.
-        sh: SH coeffs [..., C, (deg + 1) ** 2]
-        dirs: unit directions [..., 3]
+        deg: int SH deg. Currently, 0-3 supported
+        sh: jnp.ndarray SH coeffs [..., C, (deg + 1) ** 2]
+        dirs: jnp.ndarray unit directions [..., 3]
     Returns:
         [..., C]
     """
@@ -154,108 +169,146 @@ def eval_sh(deg, sh, dirs):
     if deg > 0:
         x, y, z = dirs[..., 0:1], dirs[..., 1:2], dirs[..., 2:3]
         result = (result -
-                  C1 * x * sh[..., 1] +
-                  C1 * y * sh[..., 2] -
-                  C1 * z * sh[..., 3])
+                C1 * x * sh[..., 1] +
+                C1 * y * sh[..., 2] -
+                C1 * z * sh[..., 3])
 
         if deg > 1:
             xx, yy, zz = x * x, y * y, z * z
             xy, yz, xz = x * y, y * z, x * z
             result = (result +
-                      C2[0] * xz * sh[..., 4] +
-                      C2[1] * xy * sh[..., 5] +
-                      C2[2] * (2.0 * yy - zz - xx) * sh[..., 6] +
-                      C2[3] * yz * sh[..., 7] +
-                      C2[4] * (zz - xx) * sh[..., 8])
+                    C2[0] * xz * sh[..., 4] +
+                    C2[1] * xy * sh[..., 5] +
+                    C2[2] * (2.0 * yy - zz - xx) * sh[..., 6] +
+                    C2[3] * yz * sh[..., 7] +
+                    C2[4] * (zz - xx) * sh[..., 8])
 
             if deg > 2:
                 result = (result +
-                          C3[0] * x * (3 * zz - xx) * sh[..., 9] +
-                          C3[1] * xz * y * sh[..., 10] +
-                          C3[2] * x * (4 * yy - zz - xx) * sh[..., 11] +
-                          C3[3] * y * (2 * yy - 3 * zz - 3 * xx) * sh[..., 12] +
-                          C3[4] * z * (4 * yy - zz - xx) * sh[..., 13] +
-                          C3[5] * z * (zz - xx) * sh[..., 14] +
-                          C3[6] * z * (zz - 3 * xx) * sh[..., 15])
+                C3[0] * x * (3 * zz - xx) * sh[..., 9] +
+                C3[1] * xz * y * sh[..., 10] +
+                C3[2] * x * (4 * yy - zz - xx)* sh[..., 11] +
+                C3[3] * y * (2 * yy - 3 * zz - 3 * xx) * sh[..., 12] +
+                C3[4] * z * (4 * yy - zz - xx) * sh[..., 13] +
+                C3[5] * z * (zz - xx) * sh[..., 14] +
+                C3[6] * z * (zz - 3 * xx) * sh[..., 15])
 
                 if deg > 3:
                     result = (result + C4[0] * xz * (zz - xx) * sh[..., 16] +
-                              C4[1] * xy * (3 * zz - xx) * sh[..., 17] +
-                              C4[2] * xz * (7 * yy - 1) * sh[..., 18] +
-                              C4[3] * xy * (7 * yy - 3) * sh[..., 19] +
-                              C4[4] * (yy * (35 * yy - 30) + 3) * sh[..., 20] +
-                              C4[5] * yz * (7 * yy - 3) * sh[..., 21] +
-                              C4[6] * (zz - xx) * (7 * yy - 1) * sh[..., 22] +
-                              C4[7] * yz * (zz - 3 * xx) * sh[..., 23] +
-                              C4[8] * (zz * (zz - 3 * xx) - xx * (3 * zz - xx)) * sh[..., 24])
+                            C4[1] * xy * (3 * zz - xx) * sh[..., 17] +
+                            C4[2] * xz * (7 * yy - 1) * sh[..., 18] +
+                            C4[3] * xy * (7 * yy - 3) * sh[..., 19] +
+                            C4[4] * (yy * (35 * yy - 30) + 3) * sh[..., 20] +
+                            C4[5] * yz * (7 * yy - 3) * sh[..., 21] +
+                            C4[6] * (zz - xx) * (7 * yy - 1) * sh[..., 22] +
+                            C4[7] * yz * (zz - 3 * xx) * sh[..., 23] +
+                            C4[8] * (zz * (zz - 3 * xx) - xx * (3 * zz - xx)) * sh[..., 24])
     return result
-
 
 def RGB2SH(rgb):
     return (rgb - 0.5) / C0
 
-
 def compute_norm(X, mask=None):
     b, n, _, s, _ = X.shape
-
-    pixel_norms = torch.norm(X, p=2, dim=2, keepdim=True)
-
+    
+    # 计算每张图的像素范数（L2 范数）
+    pixel_norms = torch.norm(X, p=2, dim=2, keepdim=True)  # 形状 (b, n, 1, s, s)
+    
+    # 如果没有提供mask，则使用全1的mask（即计算所有像素）
     if mask is None:
         mask = torch.ones_like(pixel_norms)
-
+    
+    # 确保mask的形状与pixel_norms一致
+    # mask = mask.expand_as(pixel_norms)
+    
+    # 应用mask：只计算mask为1的像素
     masked_norms = pixel_norms * mask
-
-    sum_per_image = torch.sum(masked_norms, dim=(3, 4))
-    total_sum = torch.sum(sum_per_image, dim=1)
-
+    
+    # 求和：对每张图的所有masked像素求和
+    sum_per_image = torch.sum(masked_norms, dim=(3, 4))      # 形状 (b, n, 1)
+    
+    # 对所有图的求和结果再求和
+    total_sum = torch.sum(sum_per_image, dim=1)             # 形状 (b, 1)
+    
+    # 计算归一化因子（mask中有效像素的总数）
     if mask is None:
         norm_factor = n * s * s
     else:
-        norm_factor = torch.sum(mask)
-
-    norm_result = total_sum / norm_factor
-
+        norm_factor = torch.sum(mask)  # 计算所有mask中的有效像素数
+    
+    # 归一化结果
+    norm_result = total_sum / norm_factor                   # 形状 (b, 1)
+    
     return norm_result.view(-1, 1, 1, 1, 1)
 
+def compute_scale(data, iters=1000):
+    B, V, _, S, S = data['xyz'].shape
+    scales = torch.nn.Parammeter(torch.randn(B))
+    optim = torch.optim.Adam(scales, lr=0.0001, eps=1e-8)
+    
+    for i in range(iters):
+        y, x = torch.meshgrid(torch.linspace(0.5, S-0.5, S, device=data['xyz'].device), torch.linspace(0.5, S-0.5, S, device=data['xyz'].device))
+        points_2d = torch.stack([x, y], dim=-1).unsqueeze(0).unsqueeze(0).repeat(B, V, 1, 1, 1)  # B V S S 2
+
+        with torch.no_grad():
+            points = data["world_points"].permute(0,1,3,4,2)
+        points_c = data['camera']['extr'][:, :, None, :3,:3]@(points*scales),+data['camera']['extr'][:, :, None, :3, 3:]
+        points_c = points_c/(points_c[..., 2:]+1e-8)
+        points_loc = data['camera']['intr'][:, :, None, :3,:3]@points_c
+
+        loss = torch.abs(points_2d-points_loc[..., :2]).reshape(B,-1).mean(dim=-1)
+        
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+
+    return scales
 
 def batch_geometric_median(points, max_iter=1000, tol=1e-6, eps=1e-8):
-    """Compute geometric median using the Weiszfeld algorithm (batched).
-
+    """
+    使用 Weiszfeld 算法计算几何中位数（支持 batch 计算）
+    
     Args:
-        points: Tensor of shape (batch_size, n_samples).
-        max_iter: Maximum number of iterations.
-        tol: Convergence threshold.
-        eps: Small constant to avoid division by zero.
-
+        points (torch.Tensor): 形状为 (batch_size, n_samples) 的输入点集
+        max_iter (int): 最大迭代次数
+        tol (float): 收敛阈值
+        eps (float): 防止除以零的小常数
+    
     Returns:
-        Geometric median, shape (batch_size, 1).
+        torch.Tensor: 几何中位数，形状 (batch_size, 1)
     """
     device = points.device
     batch_size, n_samples = points.shape
-
-    y = torch.mean(points, dim=1, keepdim=True)
-
+    
+    # 初始化为每个 batch 的均值
+    y = torch.mean(points, dim=1, keepdim=True)  # shape: (batch_size, 1)
+    
     for _ in range(max_iter):
-        diff = points - y
-        distances = torch.abs(diff)
-        distances = torch.clamp(distances, min=eps)
-
-        weights = 1.0 / distances
+        # 计算每个点到当前估计的 L1 距离（适用于标量情况）
+        diff = points - y  # shape: (batch_size, n_samples)
+        distances = torch.abs(diff)  # L1 距离（适用于标量）
+        distances = torch.clamp(distances, min=eps)  # 避免除以零
+        
+        # 计算权重并更新估计
+        weights = 1.0 / distances  # shape: (batch_size, n_samples)
         y_new = torch.sum(points * weights, dim=1, keepdim=True) / torch.sum(weights, dim=1, keepdim=True)
-
-        update_norm = torch.abs(y_new - y)
+        
+        # 检查收敛（计算每个 batch 的更新量）
+        update_norm = torch.abs(y_new - y)  # shape: (batch_size, 1)
         if torch.all(update_norm < tol):
             break
         y = y_new
+    
+    return y.squeeze(dim=-1)  # shape: (batch_size, 1)
 
-    return y.squeeze(dim=-1)
-
-
-def get_lr_func(lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000, warmup_steps=5000):
+def get_lr_func(
+    lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000, warmup_steps=5000
+):
     def helper(step):
         if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
             return 0.0
-
+        
+        # Apply delay (reverse cosine decay)
         if lr_delay_steps > 0:
             delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
                 0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
@@ -266,24 +319,24 @@ def get_lr_func(lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_step
         if warmup_steps > 0 and step < warmup_steps:
             lr = np.interp([step], [0, warmup_steps], [0, lr_init])[0]
             return lr
-
-        t = np.clip((step - warmup_steps) / (max_steps - warmup_steps), 0, 1)
+        
+        # Linear interpolation between lr_init and lr_final
+        t = np.clip((step-warmup_steps) / (max_steps-warmup_steps), 0, 1)
         linear_lerp = lr_init * (1 - t) + lr_final * t
-
+        
         return delay_rate * linear_lerp
 
     return helper
 
-
 def save_3dgs_ply(filename, positions, colors, scales, rotations, opacities):
-    """Save 3D gaussians to PLY file (compatible with 3DGS viewers like SIBR).
-
-    Args:
-        positions: [N, 3] float32
-        colors: [N, 3] float32 (RGB 0-1)
-        scales: [N, 3] float32
-        rotations: [N, 4] float32 (unit quaternions)
-        opacities: [N] float32 (0-1)
+    """
+    保存为 PLY 文件（兼容 3DGS 查看器如 SIBR）
+    参数:
+        positions: [N, 3] FP32
+        colors: [N, 3] FP32 (RGB 0-1)
+        scales: [N, 3] FP32
+        rotations: [N, 4] FP32 (单位四元数)
+        opacities: [N] FP32 (0-1)
     """
     header = """ply
     format binary_little_endian 1.0
@@ -291,17 +344,17 @@ def save_3dgs_ply(filename, positions, colors, scales, rotations, opacities):
     property float x
     property float y
     property float z
-    property float nx
+    property float nx  # 无用的法线（设为0）
     property float ny
     property float nz
-    property float f_dc_0
+    property float f_dc_0  # 球谐系数0阶（RGB）
     property float f_dc_1
     property float f_dc_2
     property float opacity
     property float scale_0
     property float scale_1
     property float scale_2
-    property float rot_0
+    property float rot_0  # 四元数
     property float rot_1
     property float rot_2
     property float rot_3
@@ -310,6 +363,7 @@ def save_3dgs_ply(filename, positions, colors, scales, rotations, opacities):
 
     with open(filename, 'wb') as f:
         f.write(header.encode('ascii'))
+        # 写入数据（按PLY格式顺序）
         data = np.zeros(len(positions), dtype=[
             ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
@@ -325,31 +379,36 @@ def save_3dgs_ply(filename, positions, colors, scales, rotations, opacities):
         data['rot_0'], data['rot_1'], data['rot_2'], data['rot_3'] = rotations.T
         data.tofile(f)
 
-
 def gradient(depth):
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=depth.device).view(1, 1, 3, 3).repeat(1, depth.shape[-3], 1, 1).cuda()
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=depth.device).view(1, 1, 3, 3).repeat(1, depth.shape[-3], 1, 1).cuda()
-
-    grad_x = F.conv2d(depth, sobel_x, padding=1, stride=1)
-    grad_y = F.conv2d(depth, sobel_y, padding=1, stride=1)
-
-    gradient_magnitude = torch.sqrt(grad_x**2 + grad_y**2)
+    # depth: [B, 1, H, W]
+    # 使用 Sobel 滤波器或差分计算梯度
+    c = depth.shape[-3]
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=depth.device).view(1, 1, 3, 3).repeat(1,c,1,1).cuda()
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=depth.device).view(1, 1, 3, 3).repeat(1,c,1,1).cuda()
+    
+    # 计算水平和垂直梯度
+    grad_x = F.conv2d(depth, sobel_x, padding=1, stride=1)  # [B, 1, H, W]
+    grad_y = F.conv2d(depth, sobel_y, padding=1, stride=1)  # [B, 1, H, W]
+    
+    # 合并梯度（可选）
+    gradient_magnitude = torch.sqrt(grad_x**2 + grad_y**2)  # [B, 1, H, W]
+    
     return gradient_magnitude
 
-
 def print_gpu_memory(prefix=""):
-    allocated = torch.cuda.memory_allocated() / 1024**2
-    reserved = torch.cuda.memory_reserved() / 1024**2
+    allocated = torch.cuda.memory_allocated() / 1024**2  # MB
+    reserved = torch.cuda.memory_reserved() / 1024**2     # MB
     print(f"{prefix} GPU Mem: Allocated={allocated:.2f} MB, Reserved={reserved:.2f} MB")
 
-
 def quaternion_multiply(q1, q2):
-    w1, x1, y1, z1 = q1.unbind(dim=2)
+    w1, x1, y1, z1 = q1.unbind(dim=2)  # 分解为标量和向量部分
     w2, x2, y2, z2 = q2.unbind(dim=2)
 
+    # 四元数乘法公式（向量化计算）
     w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
     x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
     y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
     z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
 
+    # 合并结果
     return torch.stack((w, x, y, z), dim=2)

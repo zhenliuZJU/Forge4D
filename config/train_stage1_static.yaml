@@ -1,0 +1,30 @@
+# Stage 1: static reconstruction (no temporal state tokens, no motion).
+name: 'forge4d_stage1_static'
+
+dataname: ['DNA', 'DNAP3', 'DNAP4', 'DNAP5', 'DNAP6']
+probs: [0.4, 0.15, 0.15, 0.15, 0.15]
+
+pointmap: False
+# Checkpoint of a pre-trained static VGGT (stage-1) model to initialize from.
+stage1_ckpt: '/path/to/static_518_ckpt.pth'
+lr: 0.000001
+wdecay: 1e-5
+batch_size: 1
+num_steps: 200000
+sampling_rate: 2
+stage: 'static'
+
+loss:
+  flow: 0.
+  lpips: 0.2
+
+dataset:
+  train_view_num: 4
+  resolution: 518
+  use_hr_img: False
+  data_root: '/path/to/datasets'
+  bg_color: [0., 0., 0.]
+
+record:
+  loss_freq: 200
+  eval_freq: 5000

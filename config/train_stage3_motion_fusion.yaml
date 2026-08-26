@@ -1,0 +1,34 @@
+# Stage 3: dense motion prediction + occlusion-aware Gaussian fusion.
+name: 'forge4d_stage3_motion_fusion'
+
+dataname: ['DNA', 'DNAP3', 'DNAP4', 'DNAP5', 'DNAP6']
+probs: [0.2, 0.2, 0.2, 0.2, 0.2]
+val_dataname: ['Genebody', 'DNA']
+
+pointmap: False
+# Checkpoint from stage 2.
+stage1_ckpt: '/path/to/stage2_ckpt.pth'
+lr: 0.000001
+wdecay: 1e-5
+batch_size: 1
+num_steps: 100000
+sampling_rate: 2
+# Trains the motion head + Gaussian fusion head; all other modules frozen.
+stage: 'motion'
+
+# Loss weights. `flow` enables the paper's occlusion-aware optical-flow loss
+# (L_flow, Eq. 7); set `flow: 0.` to reproduce the original matched-fusion-only run.
+loss:
+  flow: 10.
+  lpips: 0.2
+
+dataset:
+  train_view_num: 4
+  resolution: 518
+  use_hr_img: False
+  data_root: '/path/to/datasets'
+  bg_color: [0., 0., 0.]
+
+record:
+  loss_freq: 200
+  eval_freq: 100000

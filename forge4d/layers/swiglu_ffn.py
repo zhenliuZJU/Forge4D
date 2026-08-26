@@ -5,6 +5,7 @@
 
 import os
 from typing import Callable, Optional
+import warnings
 
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -34,8 +35,20 @@ class SwiGLUFFN(nn.Module):
 
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
+# try:
+#     if XFORMERS_ENABLED:
+#         from xformers.ops import SwiGLU
+
+#         XFORMERS_AVAILABLE = True
+#         warnings.warn("xFormers is available (SwiGLU)")
+#     else:
+#         warnings.warn("xFormers is disabled (SwiGLU)")
+#         raise ImportError
+# except ImportError:
 SwiGLU = SwiGLUFFN
 XFORMERS_AVAILABLE = False
+
+# warnings.warn("xFormers is not available (SwiGLU)")
 
 
 class SwiGLUFFNFused(SwiGLU):

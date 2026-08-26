@@ -1,31 +1,51 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-dist/
 build/
+dist/
+.eggs/
 
-# Jupyter
+# Jupyter / notebooks
+*.ipynb
 .ipynb_checkpoints/
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Checkpoints & data
-*.pth
-*.ckpt
-checkpoints/
+# Training / inference artifacts
+runs/
 output/
-vis_*/
+experiment*/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
 
-# Dataset
+# Logs & visualization
+*.log
+*.mp4
+*.avi
+*.jpg
+*.jpeg
+*.png
+!**/README.md
+vis*/
+debug*/
+3d_trajectories.png
+
+# Data
 data/
+datasets/
+*.bin
+*.npy
 
-# Misc
+# Environment / IDE / OS
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Internal tooling
 .ossutil_checkpoint/
-metric_checkpoint/

@@ -1,14 +1,32 @@
-torch>=2.0.0
-torchvision>=0.15.0
-numpy>=1.24.0
-gsplat>=1.0.0
-huggingface-hub>=0.20.0
-xformers>=0.0.22
-opencv-python>=4.8.0
-Pillow>=10.0.0
-scipy>=1.10.0
-matplotlib>=3.7.0
-einops>=0.6.0
-lpips>=0.1.4
-tqdm>=4.65.0
-open3d>=0.17.0
+# Forge4D — core dependencies
+torch>=2.1.0
+torchvision>=0.16.0
+numpy
+opencv-python
+Pillow
+einops
+yacs
+PyYAML
+tqdm
+scipy
+matplotlib
+
+# 3D Gaussian splatting & geometry
+gsplat>=1.5.3
+open3d
+plyfile
+
+# Model / training
+accelerate            # distributed training (all train_*.py)
+xformers              # efficient attention in the VGGT backbone (vggt/layers/attention.py)
+huggingface_hub       # PyTorchModelHubMixin support in the model classes
+lpips                 # perceptual loss during training (lib/loss.py)
+
+# Data preparation (prepare_data/render_data.py + vendored taichi_three)
+taichi
+taichi_glsl
+
+# Misc
+psutil
+omegaconf
+typeguard

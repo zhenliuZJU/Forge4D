@@ -1,3 +1,4 @@
+# Inference config for runfiles/inference.py.
 name: 'inference'
 
 dataname: ['DNA']
@@ -7,5 +8,5 @@ dataset:
   train_view_num: 4
   resolution: 518
   use_hr_img: False
-  data_root: '/path/to/your/data'
-  bg_color: [0.,0.,0.]
+  data_root: '/path/to/datasets'
+  bg_color: [0., 0., 0.]

@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 def file_backup(exp_path, cfg, train_script):
     shutil.copy(train_script, exp_path)
-    shutil.copytree('vggt', os.path.join(exp_path, 'vggt'), dirs_exist_ok=True)
+    shutil.copytree('forge4d', os.path.join(exp_path, 'forge4d'), dirs_exist_ok=True)
     shutil.copytree('config', os.path.join(exp_path, 'config'), dirs_exist_ok=True)
     shutil.copytree('gaussian_renderer', os.path.join(exp_path, 'gaussian_renderer'), dirs_exist_ok=True)
     for sub_dir in ['lib']:
