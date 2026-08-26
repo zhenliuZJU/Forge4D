@@ -17,6 +17,7 @@
   <a href="https://zhlinup.github.io/">Zehong Lin</a>,
   <a href="https://sites.google.com/site/zhusiyucs/home">Siyu Zhu</a>,
   <a href="https://scholar.google.com/citations?user=GHOQKCwAAAAJ&hl=zh-CN&oi=ao">Zilong Dong</a>,
+  <a href="https://sites.google.com/view/stevenhoi/home">Steven Hoi</a>,
   <a href="https://eejzhang.people.ust.hk/">Jun Zhang</a>
 </p>
 
